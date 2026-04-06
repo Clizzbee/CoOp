@@ -67,6 +67,13 @@ TETROMINOES = {
 }
 SHAPE_KEYS = list(TETROMINOES.keys())
 
+HIGH_SCORE_FILE = "orbital_tetris_hs.txt"
+
+# Menu state constants
+STATE_MENU     = "menu"
+STATE_CONTROLS = "controls"
+STATE_PLAYING  = "playing"
+
 
 # ---------------------------------------------------------------------------
 # Audio
@@ -274,6 +281,80 @@ class FallingPiece:
 
 
 # ---------------------------------------------------------------------------
+# High score persistence
+# ---------------------------------------------------------------------------
+def load_high_score() -> int:
+    try:
+        with open(HIGH_SCORE_FILE, 'r') as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+def save_high_score(score: int) -> None:
+    try:
+        with open(HIGH_SCORE_FILE, 'w') as f:
+            f.write(str(score))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Menu button
+# ---------------------------------------------------------------------------
+class MenuButton:
+    """A rounded rectangle button with hover glow and click animation."""
+
+    NORMAL_COLOR = (20,  20,  40)
+    BORDER_COLOR = (0,   255, 255)
+    HOVER_COLOR  = (0,   200, 220)
+    TEXT_COLOR   = (255, 255, 255)
+    CLICK_COLOR  = (0,   255, 255)
+
+    def __init__(self, rect: pygame.Rect, text: str, font: pygame.font.Font) -> None:
+        self.rect      = rect
+        self.text      = text
+        self.font      = font
+        self.hovered   = False
+        self._click_t  = 0   # frames remaining in click flash
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        """Return True if this button was clicked."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.collidepoint(event.pos):
+                self._click_t = 8
+                return True
+        return False
+
+    def update(self) -> None:
+        self.hovered = self.rect.collidepoint(pygame.mouse.get_pos())
+        if self._click_t > 0:
+            self._click_t -= 1
+
+    def draw(self, surface: pygame.Surface, alpha_surf: pygame.Surface) -> None:
+        # Glow halo on hover
+        if self.hovered or self._click_t > 0:
+            glow = self.rect.inflate(10, 10)
+            pygame.draw.rect(alpha_surf, (*self.BORDER_COLOR, 60), glow, border_radius=14)
+
+        # Fill
+        fill_color = self.CLICK_COLOR if self._click_t > 0 else (
+            (30, 60, 70) if self.hovered else self.NORMAL_COLOR
+        )
+        pygame.draw.rect(surface, fill_color, self.rect, border_radius=10)
+
+        # Border
+        border_color = self.CLICK_COLOR if self._click_t > 0 else (
+            self.HOVER_COLOR if self.hovered else self.BORDER_COLOR
+        )
+        pygame.draw.rect(surface, border_color, self.rect, 2, border_radius=10)
+
+        # Label
+        text_color = (10, 10, 10) if self._click_t > 0 else self.TEXT_COLOR
+        label = self.font.render(self.text, True, text_color)
+        surface.blit(label, label.get_rect(center=self.rect.center))
+
+
+# ---------------------------------------------------------------------------
 # Main game class
 # ---------------------------------------------------------------------------
 class Game:
@@ -291,9 +372,34 @@ class Game:
         self.font       = pygame.font.SysFont("Consolas", 26, bold=True)
         self.large_font = pygame.font.SysFont("Verdana",  60, bold=True)
         self.small_font = pygame.font.SysFont("Consolas", 16)
+        self.title_font = pygame.font.SysFont("Verdana",  72, bold=True)
+        self.sub_font   = pygame.font.SysFont("Consolas", 20, bold=False)
 
         self.bg_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
         self._build_background()
+
+        self.high_score   = load_high_score()
+        self.state        = STATE_MENU
+        self.menu_angle   = 0.0        # slowly rotating decorative wheel
+        self.menu_tick    = 0          # frame counter for animations
+
+        # Build menu buttons
+        bw, bh = 260, 52
+        bx = CX - bw // 2
+        self._btn_play     = MenuButton(pygame.Rect(bx, 460, bw, bh), "▶  PLAY",     self.font)
+        self._btn_controls = MenuButton(pygame.Rect(bx, 530, bw, bh), "⌨  CONTROLS", self.font)
+        self._btn_quit     = MenuButton(pygame.Rect(bx, 600, bw, bh), "✕  QUIT",     self.font)
+        self._btn_back     = MenuButton(pygame.Rect(bx, 660, bw, bh), "←  BACK",     self.font)
+
+        # Pre-populate decorative wheel with random colours (sparse)
+        self.deco_wheel = [[None] * N_SLOTS for _ in range(LAYERS)]
+        for L in range(LAYERS):
+            for slot in range(N_SLOTS):
+                if random.random() < 0.35:
+                    self.deco_wheel[L][slot] = random.choice(
+                        [d['color'] for d in TETROMINOES.values()]
+                    )
+
         self.reset_game()
 
     def _build_background(self) -> None:
@@ -311,6 +417,10 @@ class Game:
         self.wheel       = [[None] * N_SLOTS for _ in range(LAYERS)]
         self.wheel_angle = 0.0
         self.rotation_speed = 3.0
+
+        # Accumulators for notched, grid-locked movement
+        self.accumulated_drag = 0.0
+        self.accumulated_keys = 0.0
 
         self.score         = 0
         self.lines_cleared = 0
@@ -402,13 +512,24 @@ class Game:
         keys = pygame.key.get_pressed()
         mouse_buttons = pygame.mouse.get_pressed()
 
-        # Keyboard movement
+        # Keyboard movement (accumulate for discrete grid steps)
+        kb_delta = 0
         if keys[pygame.K_LEFT]:
-            self.wheel_angle = (self.wheel_angle + self.rotation_speed) % 360
+            kb_delta += self.rotation_speed
         if keys[pygame.K_RIGHT]:
-            self.wheel_angle = (self.wheel_angle - self.rotation_speed) % 360
+            kb_delta -= self.rotation_speed
 
-        # Mouse movement (Relative Drag logic)
+        if kb_delta != 0:
+            self.accumulated_keys += kb_delta
+            # Snap to the next slot if we've accumulated enough rotation
+            if abs(self.accumulated_keys) >= SLOT_ANGLE:
+                steps = int(self.accumulated_keys / SLOT_ANGLE)
+                self.wheel_angle = (self.wheel_angle + steps * SLOT_ANGLE) % 360
+                self.accumulated_keys -= steps * SLOT_ANGLE
+        else:
+            self.accumulated_keys = 0.0
+
+        # Mouse movement (Relative Drag logic, accumulate for discrete grid steps)
         if mouse_buttons[0]:
             mx, my = pygame.mouse.get_pos()
             rel_x, rel_y = mx - CX, CY - my
@@ -420,12 +541,19 @@ class Game:
                 # Correct for 180/-180 wrap around jump
                 if delta > 180: delta -= 360
                 if delta < -180: delta += 360
-                # Rotate wheel by the same amount the mouse moved
-                self.wheel_angle = (self.wheel_angle + delta) % 360
+                
+                self.accumulated_drag += delta
+                
+                # Lock to grid slots
+                if abs(self.accumulated_drag) >= SLOT_ANGLE:
+                    steps = int(self.accumulated_drag / SLOT_ANGLE)
+                    self.wheel_angle = (self.wheel_angle + steps * SLOT_ANGLE) % 360
+                    self.accumulated_drag -= steps * SLOT_ANGLE
             
             self.last_mouse_angle = current_m_angle
         else:
             self.last_mouse_angle = None
+            self.accumulated_drag = 0.0  # Reset on release
 
         # Particle lifecycle
         for p in self.particles:
@@ -454,6 +582,155 @@ class Game:
         if self.current_piece.r <= self.target_r:
             self.current_piece.r = self.target_r
             self.lock_piece(target_i)
+
+    # ------------------------------------------------------------------
+    # Menu
+    # ------------------------------------------------------------------
+    def _draw_deco_wheel(self, alpha_surf: pygame.Surface, angle: float) -> None:
+        """Draw the dim decorative wheel used as menu background art."""
+        dim_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        for L in range(LAYERS):
+            for slot in range(N_SLOTS):
+                color = self.deco_wheel[L][slot]
+                if color is None:
+                    continue
+                r_inner      = INNER_RADIUS + L * LAYER_WIDTH
+                theta_center = angle + slot * SLOT_ANGLE
+                poly = get_arc_points(r_inner, r_inner + LAYER_WIDTH, theta_center, SLOT_ANGLE)
+                dc = tuple(int(c * 0.28) for c in color)
+                pygame.draw.polygon(dim_surf, dc, poly)
+        self.main_surf.blit(dim_surf, (0, 0))
+
+        outer_r = INNER_RADIUS + LAYERS * LAYER_WIDTH
+        for L in range(LAYERS + 1):
+            r = INNER_RADIUS + L * LAYER_WIDTH
+            pygame.draw.circle(self.main_surf, (30, 30, 50), (CX, CY), r, 1)
+        for i in range(N_SLOTS):
+            theta = angle + i * SLOT_ANGLE - SLOT_ANGLE / 2
+            p1 = polar_to_cartesian(INNER_RADIUS, theta)
+            p2 = polar_to_cartesian(outer_r, theta)
+            pygame.draw.line(self.main_surf, (30, 30, 50), p1, p2, 1)
+
+        pygame.draw.circle(self.main_surf, COLOR_HUB,        (CX, CY), INNER_RADIUS)
+        pygame.draw.circle(self.main_surf, COLOR_HUB_BORDER, (CX, CY), INNER_RADIUS, 2)
+
+    def _draw_menu(self) -> None:
+        self.main_surf.blit(self.bg_surf, (0, 0))
+        alpha_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        self._draw_deco_wheel(alpha_surf, self.menu_angle)
+
+        pulse = 0.75 + 0.25 * math.sin(self.menu_tick * 0.04)
+        glow_alpha = int(pulse * 80)
+        for r in range(60, 0, -10):
+            pygame.draw.circle(alpha_surf, (0, 255, 255, glow_alpha // (r // 10 + 1)),
+                               (CX, 200), r)
+
+        shadow = self.title_font.render("ORBITAL TETRIS", True, (0, 130, 130))
+        title  = self.title_font.render("ORBITAL TETRIS", True, COLOR_HUB_BORDER)
+        self.main_surf.blit(shadow, shadow.get_rect(center=(CX + 3, 203)))
+        self.main_surf.blit(title,  title.get_rect(center=(CX, 200)))
+
+        sub = self.sub_font.render("A circular Tetris variant", True, COLOR_GRID)
+        self.main_surf.blit(sub, sub.get_rect(center=(CX, 265)))
+
+        if self.high_score > 0:
+            hs_label = self.font.render(f"BEST  {self.high_score}", True, (255, 220, 80))
+            self.main_surf.blit(hs_label, hs_label.get_rect(center=(CX, 390)))
+
+        for btn in (self._btn_play, self._btn_controls, self._btn_quit):
+            btn.update()
+            btn.draw(self.main_surf, alpha_surf)
+
+        self.main_surf.blit(alpha_surf, (0, 0))
+        self.screen.blit(self.main_surf, (0, 0))
+        pygame.display.flip()
+
+    def _draw_controls(self) -> None:
+        self.main_surf.blit(self.bg_surf, (0, 0))
+        alpha_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        self._draw_deco_wheel(alpha_surf, self.menu_angle)
+
+        panel = pygame.Rect(CX - 280, 80, 560, 565)
+        pygame.draw.rect(self.main_surf, (15, 15, 28), panel, border_radius=16)
+        pygame.draw.rect(alpha_surf, (*COLOR_HUB_BORDER, 160), panel, 2, border_radius=16)
+
+        heading = self.font.render("CONTROLS", True, COLOR_HUB_BORDER)
+        self.main_surf.blit(heading, heading.get_rect(center=(CX, 115)))
+
+        lines = [
+            ("MOUSE",          ""),
+            ("Left drag",      "Spin the wheel"),
+            ("Right click",    "Rotate piece"),
+            ("Middle/scroll",  "Hold piece"),
+            ("Click centre",   "Hard drop"),
+            ("",               ""),
+            ("KEYBOARD",       ""),
+            ("\u2190 \u2192",  "Spin the wheel"),
+            ("\u2191",         "Rotate piece"),
+            ("\u2193 / Space", "Hard drop"),
+            ("C",              "Hold piece"),
+            ("F / F11",        "Toggle fullscreen"),
+            ("ESC",            "Quit / Back"),
+        ]
+
+        y = 158
+        for key, desc in lines:
+            if desc == "" and key == "":
+                y += 8
+                continue
+            if desc == "":
+                hdr = self.sub_font.render(key, True, (0, 200, 200))
+                self.main_surf.blit(hdr, (panel.left + 30, y))
+                pygame.draw.line(self.main_surf, (0, 120, 120),
+                                 (panel.left + 30, y + 22),
+                                 (panel.right - 30, y + 22), 1)
+                y += 34
+            else:
+                k_surf = self.sub_font.render(key,  True, (220, 220, 220))
+                d_surf = self.sub_font.render(desc, True, COLOR_GRID)
+                self.main_surf.blit(k_surf, (panel.left + 40,  y))
+                self.main_surf.blit(d_surf, (panel.left + 230, y))
+                y += 28
+
+        self._btn_back.update()
+        self._btn_back.draw(self.main_surf, alpha_surf)
+
+        self.main_surf.blit(alpha_surf, (0, 0))
+        self.screen.blit(self.main_surf, (0, 0))
+        pygame.display.flip()
+
+    def _update_menu(self) -> None:
+        self.menu_angle = (self.menu_angle + 0.18) % 360
+        self.menu_tick += 1
+
+    def _handle_menu_events(self, event: pygame.event.Event) -> bool:
+        """Return False to quit."""
+        if event.type == pygame.QUIT:
+            return False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                if self.state == STATE_CONTROLS:
+                    self.state = STATE_MENU
+                else:
+                    return False
+            elif event.key in (pygame.K_F11, pygame.K_f):
+                pygame.display.toggle_fullscreen()
+            elif event.key == pygame.K_RETURN and self.state == STATE_MENU:
+                self.reset_game()
+                self.state = STATE_PLAYING
+
+        if self.state == STATE_MENU:
+            if self._btn_play.handle_event(event):
+                self.reset_game()
+                self.state = STATE_PLAYING
+            elif self._btn_controls.handle_event(event):
+                self.state = STATE_CONTROLS
+            elif self._btn_quit.handle_event(event):
+                return False
+        elif self.state == STATE_CONTROLS:
+            if self._btn_back.handle_event(event):
+                self.state = STATE_MENU
+        return True
 
     def _draw_ui_box(self, cx: int, cy: int, title: str, piece_id: str | None, alpha_surf: pygame.Surface) -> None:
         box = pygame.Rect(cx - 60, cy - 60, 120, 120)
@@ -515,18 +792,25 @@ class Game:
         self.main_surf.blit(controls, (10, SCREEN_HEIGHT - 30))
 
         if self.game_over:
+            # Save high score
+            if self.score > self.high_score:
+                self.high_score = self.score
+                save_high_score(self.high_score)
+
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 200))
             self.main_surf.blit(overlay, (0, 0))
-            panel = pygame.Rect(CX - 250, CY - 100, 500, 200)
+            panel = pygame.Rect(CX - 250, CY - 120, 500, 240)
             pygame.draw.rect(self.main_surf, COLOR_HUB,    panel, 0, 15)
             pygame.draw.rect(self.main_surf, (255, 50, 50), panel, 3, 15)
             go_surf    = self.large_font.render("GAME OVER",                   True, (255, 80,  80))
-            score_surf = self.font.render(f"Final Score: {self.score}",         True, WHITE)
-            hint_surf  = self.font.render("Press SPACE to Restart",             True, COLOR_GRID)
-            self.main_surf.blit(go_surf,    go_surf.get_rect(center=(CX, CY - 40)))
-            self.main_surf.blit(score_surf, score_surf.get_rect(center=(CX, CY + 20)))
-            self.main_surf.blit(hint_surf,  hint_surf.get_rect(center=(CX, CY + 60)))
+            score_surf = self.font.render(f"Score: {self.score}",              True, WHITE)
+            hs_surf    = self.font.render(f"Best:  {self.high_score}",         True, (255, 220, 80))
+            hint_surf  = self.font.render("SPACE: Restart  |  M: Menu",        True, COLOR_GRID)
+            self.main_surf.blit(go_surf,    go_surf.get_rect(center=(CX, CY - 60)))
+            self.main_surf.blit(score_surf, score_surf.get_rect(center=(CX, CY)))
+            self.main_surf.blit(hs_surf,    hs_surf.get_rect(center=(CX, CY + 40)))
+            self.main_surf.blit(hint_surf,  hint_surf.get_rect(center=(CX, CY + 88)))
 
         dx, dy = 0, 0
         if self.shake > 0:
@@ -540,18 +824,32 @@ class Game:
     def run(self) -> None:
         running = True
         while running:
+            # ---- Menu states ----------------------------------------
+            if self.state in (STATE_MENU, STATE_CONTROLS):
+                for event in pygame.event.get():
+                    if not self._handle_menu_events(event):
+                        running = False
+                self._update_menu()
+                if self.state == STATE_MENU:
+                    self._draw_menu()
+                else:
+                    self._draw_controls()
+                self.clock.tick(FPS)
+                continue
+
+            # ---- Playing state --------------------------------------
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if not self.game_over:
-                        if event.button == 3: # Right Click: Rotate
+                        if event.button == 3:
                             self.current_piece.rotate()
                             self.audio.play('rotate')
-                        elif event.button in (2, 4, 5): # Middle Click/Scroll: Hold
+                        elif event.button in (2, 4, 5):
                             self.hold_piece()
-                        elif event.button == 1: # Left Click: Hard drop (if center clicked)
+                        elif event.button == 1:
                             mx, my = pygame.mouse.get_pos()
                             dist = math.sqrt((mx - CX)**2 + (my - CY)**2)
                             if dist < INNER_RADIUS:
@@ -559,12 +857,14 @@ class Game:
 
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        running = False
+                        self.state = STATE_MENU
                     elif event.key in (pygame.K_F11, pygame.K_f):
                         pygame.display.toggle_fullscreen()
                     elif self.game_over:
                         if event.key == pygame.K_SPACE:
                             self.reset_game()
+                        elif event.key == pygame.K_m:
+                            self.state = STATE_MENU
                     else:
                         if event.key in (pygame.K_DOWN, pygame.K_SPACE):
                             self.current_piece.r = self.target_r
