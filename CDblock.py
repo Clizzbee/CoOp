@@ -2,7 +2,11 @@
 Orbital Tetris — a circular Tetris variant built with Pygame.
 
 Controls:
-  LEFT / RIGHT : Rotate the wheel
+  MOUSE LEFT   : Drag to rotate the wheel (stays in place on release)
+  MOUSE RIGHT  : Rotate the falling piece
+  MOUSE MIDDLE : Hold piece
+  CENTER CLICK : Hard drop
+  LEFT / RIGHT : Rotate the wheel (Keyboard)
   UP           : Rotate the falling piece
   DOWN / SPACE : Hard drop
   C            : Hold piece
@@ -73,14 +77,6 @@ def create_wav_sound(
     volume: float = 0.1,
     slide: float = 0.0,
 ) -> pygame.mixer.Sound:
-    """Generate a retro square-wave sound entirely in memory.
-
-    Args:
-        frequency: Starting frequency in Hz.
-        duration:  Length of the sound in seconds.
-        volume:    Peak amplitude (0.0 – 1.0).
-        slide:     Total frequency change applied linearly over the duration.
-    """
     sample_rate = 44100
     n_samples   = int(sample_rate * duration)
 
@@ -94,7 +90,6 @@ def create_wav_sound(
             t            = i / sample_rate
             current_freq = frequency + slide * (i / n_samples)
 
-            # Simple attack / decay envelope
             if i < 500:
                 env = i / 500.0
             elif i > n_samples - 1000:
@@ -102,7 +97,6 @@ def create_wav_sound(
             else:
                 env = 1.0
 
-            # Square wave derived from a sine
             square = 1.0 if math.sin(2.0 * math.pi * current_freq * t) > 0 else -1.0
             sample = int(volume * env * 32767.0 * square)
             wav.writeframesraw(struct.pack('<h', sample))
@@ -112,8 +106,6 @@ def create_wav_sound(
 
 
 class SoundManager:
-    """Owns all game sounds and provides a simple ``play`` interface."""
-
     def __init__(self) -> None:
         self._sounds = {
             'rotate': create_wav_sound(800, 0.05, 0.05),
@@ -134,7 +126,6 @@ class SoundManager:
 def polar_to_cartesian(
     r: float, theta_deg: float, cx: int = CX, cy: int = CY
 ) -> tuple[float, float]:
-    """Convert polar coords (r, θ°) to screen Cartesian coords."""
     theta_rad = math.radians(theta_deg)
     return cx + r * math.cos(theta_rad), cy - r * math.sin(theta_rad)
 
@@ -148,7 +139,6 @@ def get_arc_points(
     cy: int = CY,
     steps: int = 10,
 ) -> list[tuple[float, float]]:
-    """Return polygon vertices that approximate a curved arc segment."""
     theta_start = theta_center - width_deg / 2
     theta_end   = theta_center + width_deg / 2
 
@@ -183,20 +173,17 @@ def draw_segment(
     cy: int = CY,
     outline_only: bool = False,
 ) -> None:
-    """Draw one arc segment with optional glow onto *surface* / *alpha_surface*."""
     poly = get_arc_points(r_inner, r_outer, theta_center, width_deg, cx, cy)
 
     if outline_only:
         pygame.draw.polygon(alpha_surface, (*color, 120), poly, 2)
         return
 
-    # Soft glow halo on the alpha layer
     glow_poly = get_arc_points(
         r_inner - 3, r_outer + 3, theta_center, width_deg + 1, cx, cy
     )
     pygame.draw.polygon(alpha_surface, (*color, 60), glow_poly)
 
-    # Filled segment + bright highlight edge
     pygame.draw.polygon(surface, color, poly)
     highlight = tuple(min(255, c + 50) for c in color)
     pygame.draw.polygon(surface, highlight, poly, 1)
@@ -206,8 +193,6 @@ def draw_segment(
 # Game objects
 # ---------------------------------------------------------------------------
 class Particle:
-    """A short-lived spark ejected when a layer is cleared."""
-
     def __init__(self, x: float, y: float, angle_deg: float, color: tuple) -> None:
         self.x     = x
         self.y     = y
@@ -238,17 +223,14 @@ class Particle:
 
 
 class FallingPiece:
-    """A tetromino falling radially inward through the wheel."""
-
     def __init__(self, shape_id: str | None = None) -> None:
         self.shape_id = shape_id or random.choice(SHAPE_KEYS)
         data          = TETROMINOES[self.shape_id]
         self.color    = data['color']
-        self.blocks   = list(data['blocks'])  # list of (dslot, dlayer) offsets
-        self.r        = CX + 50              # current radial position (pixels)
+        self.blocks   = list(data['blocks'])
+        self.r        = CX + 50
 
     def rotate(self) -> None:
-        """Rotate 90° clockwise (no-op for the O piece)."""
         if self.shape_id == 'O':
             return
         self.blocks = [(-dl, ds) for ds, dl in self.blocks]
@@ -300,7 +282,6 @@ class Game:
             (SCREEN_WIDTH, SCREEN_HEIGHT),
             pygame.SCALED | pygame.RESIZABLE | pygame.HWSURFACE | pygame.DOUBLEBUF,
         )
-        # Off-screen buffer used for screen-shake rendering
         self.main_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
 
         pygame.display.set_caption("Orbital Tetris")
@@ -315,11 +296,7 @@ class Game:
         self._build_background()
         self.reset_game()
 
-    # ------------------------------------------------------------------
-    # Set-up helpers
-    # ------------------------------------------------------------------
     def _build_background(self) -> None:
-        """Pre-render a radial gradient background to *self.bg_surf*."""
         max_dist = math.sqrt(CX**2 + CY**2)
         for y in range(SCREEN_HEIGHT):
             for x in range(SCREEN_WIDTH):
@@ -351,10 +328,10 @@ class Game:
 
         self.target_layer = 0
         self.target_r     = INNER_RADIUS
+        
+        # Track relative mouse movement
+        self.last_mouse_angle = None
 
-    # ------------------------------------------------------------------
-    # Game logic
-    # ------------------------------------------------------------------
     def _spawn_next_piece(self) -> None:
         self.current_piece = self.next_piece
         self.next_piece    = FallingPiece()
@@ -364,7 +341,6 @@ class Game:
         )
 
     def lock_piece(self, base_slot: int) -> None:
-        """Commit the current piece to the wheel grid."""
         highest = self.target_layer + max(dl for _, dl in self.current_piece.blocks)
         if highest >= LAYERS:
             self.game_over = True
@@ -381,7 +357,6 @@ class Game:
         self._spawn_next_piece()
 
     def check_clears(self) -> None:
-        """Remove fully-filled layers and award points."""
         cleared = [L for L in range(LAYERS) if None not in self.wheel[L]]
         if not cleared:
             return
@@ -389,7 +364,6 @@ class Game:
         self.audio.play('clear')
         self.shake = 12
 
-        # Spawn burst particles along each cleared layer
         for L in cleared:
             r = INNER_RADIUS + L * LAYER_WIDTH + LAYER_WIDTH // 2
             for slot in range(N_SLOTS):
@@ -399,7 +373,6 @@ class Game:
                 for _ in range(3):
                     self.particles.append(Particle(px, py, theta, color))
 
-        # Collapse cleared layers (removed rows sink to the top)
         kept = [row for i, row in enumerate(self.wheel) if i not in cleared]
         self.wheel = kept + [[None] * N_SLOTS for _ in cleared]
 
@@ -408,7 +381,6 @@ class Game:
         self.score         += (n ** 2) * 100
 
     def hold_piece(self) -> None:
-        """Swap the current piece into the hold slot."""
         if not self.can_hold:
             return
 
@@ -422,19 +394,38 @@ class Game:
 
         self.can_hold = False
 
-    # ------------------------------------------------------------------
-    # Update
-    # ------------------------------------------------------------------
     def update(self) -> None:
         if self.game_over:
             return
 
-        # Wheel rotation input
+        # --- Rotation Logic (Keyboard + Mouse) ---
         keys = pygame.key.get_pressed()
+        mouse_buttons = pygame.mouse.get_pressed()
+
+        # Keyboard movement
         if keys[pygame.K_LEFT]:
             self.wheel_angle = (self.wheel_angle + self.rotation_speed) % 360
         if keys[pygame.K_RIGHT]:
             self.wheel_angle = (self.wheel_angle - self.rotation_speed) % 360
+
+        # Mouse movement (Relative Drag logic)
+        if mouse_buttons[0]:
+            mx, my = pygame.mouse.get_pos()
+            rel_x, rel_y = mx - CX, CY - my
+            current_m_angle = math.degrees(math.atan2(rel_y, rel_x))
+            
+            if self.last_mouse_angle is not None:
+                # Calculate movement since last frame
+                delta = current_m_angle - self.last_mouse_angle
+                # Correct for 180/-180 wrap around jump
+                if delta > 180: delta -= 360
+                if delta < -180: delta += 360
+                # Rotate wheel by the same amount the mouse moved
+                self.wheel_angle = (self.wheel_angle + delta) % 360
+            
+            self.last_mouse_angle = current_m_angle
+        else:
+            self.last_mouse_angle = None
 
         # Particle lifecycle
         for p in self.particles:
@@ -444,13 +435,12 @@ class Game:
         # Advance piece inward
         self.current_piece.r -= self.fall_speed
 
-        # Work out the landing layer for the current piece position
-        target_i      = round((90 - self.wheel_angle) / SLOT_ANGLE) % N_SLOTS
+        # Work out the landing layer
+        target_i = round((90 - self.wheel_angle) / SLOT_ANGLE) % N_SLOTS
         max_req_layer = 0
 
         for ds, dl in self.current_piece.blocks:
             slot = (target_i + ds) % N_SLOTS
-            # Find the topmost occupied layer in this column
             occ = next(
                 (L for L in range(LAYERS - 1, -1, -1) if self.wheel[L][slot] is not None),
                 -1,
@@ -461,22 +451,11 @@ class Game:
         self.target_layer = max_req_layer
         self.target_r     = INNER_RADIUS + self.target_layer * LAYER_WIDTH
 
-        # Clamp piece to landing position and lock if it has arrived
         if self.current_piece.r <= self.target_r:
             self.current_piece.r = self.target_r
             self.lock_piece(target_i)
 
-    # ------------------------------------------------------------------
-    # Drawing
-    # ------------------------------------------------------------------
-    def _draw_ui_box(
-        self,
-        cx: int,
-        cy: int,
-        title: str,
-        piece_id: str | None,
-        alpha_surf: pygame.Surface,
-    ) -> None:
+    def _draw_ui_box(self, cx: int, cy: int, title: str, piece_id: str | None, alpha_surf: pygame.Surface) -> None:
         box = pygame.Rect(cx - 60, cy - 60, 120, 120)
         pygame.draw.rect(self.main_surf, COLOR_HUB,        box,              0, 10)
         pygame.draw.rect(alpha_surf,    (*COLOR_HUB_BORDER, 100), box.inflate(4, 4), 2, 12)
@@ -492,7 +471,6 @@ class Game:
         self.main_surf.blit(self.bg_surf, (0, 0))
         alpha_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
 
-        # --- Grid rings and spokes ---
         for L in range(LAYERS + 1):
             r = INNER_RADIUS + L * LAYER_WIDTH
             pygame.draw.circle(self.main_surf, COLOR_GRID,      (CX, CY), r, 1)
@@ -506,21 +484,14 @@ class Game:
             pygame.draw.line(self.main_surf, COLOR_GRID,      p1, p2, 1)
             pygame.draw.line(alpha_surf,     COLOR_GRID_GLOW, p1, p2, 2)
 
-        # --- Locked pieces ---
         for L in range(LAYERS):
             for slot in range(N_SLOTS):
                 color = self.wheel[L][slot]
-                if color is None:
-                    continue
-                r_inner     = INNER_RADIUS + L * LAYER_WIDTH
+                if color is None: continue
+                r_inner      = INNER_RADIUS + L * LAYER_WIDTH
                 theta_center = self.wheel_angle + slot * SLOT_ANGLE
-                draw_segment(
-                    self.main_surf, alpha_surf, color,
-                    r_inner, r_inner + LAYER_WIDTH,
-                    theta_center, SLOT_ANGLE,
-                )
+                draw_segment(self.main_surf, alpha_surf, color, r_inner, r_inner + LAYER_WIDTH, theta_center, SLOT_ANGLE)
 
-        # --- Central hub ---
         pygame.draw.circle(self.main_surf, COLOR_HUB,        (CX, CY), INNER_RADIUS)
         pygame.draw.circle(alpha_surf,     COLOR_HUB_GLOW,   (CX, CY), INNER_RADIUS + 2, 5)
         pygame.draw.circle(self.main_surf, COLOR_HUB_BORDER, (CX, CY), INNER_RADIUS,     2)
@@ -530,62 +501,61 @@ class Game:
         self.main_surf.blit(score_label, score_label.get_rect(center=(CX, CY - 25)))
         self.main_surf.blit(score_value, score_value.get_rect(center=(CX, CY + 15)))
 
-        # --- Ghost piece + active piece ---
         if not self.game_over:
             self.current_piece.draw(self.main_surf, alpha_surf, ghost_r=self.target_r)
             self.current_piece.draw(self.main_surf, alpha_surf)
 
-        # --- Particles ---
-        for p in self.particles:
-            p.draw(alpha_surf)
+        for p in self.particles: p.draw(alpha_surf)
 
-        # --- HUD boxes ---
         self._draw_ui_box(100, 100, "HOLD", self.hold_id,              alpha_surf)
         self._draw_ui_box(700, 100, "NEXT", self.next_piece.shape_id,  alpha_surf)
 
-        # Composite alpha layer
         self.main_surf.blit(alpha_surf, (0, 0))
-
-        controls = self.small_font.render("F / F11: Fullscreen  |  ESC: Quit", True, COLOR_GRID)
+        controls = self.small_font.render("F: Fullscreen  |  ESC: Quit  |  Mouse: Drag to Spin", True, COLOR_GRID)
         self.main_surf.blit(controls, (10, SCREEN_HEIGHT - 30))
 
-        # --- Game-over overlay ---
         if self.game_over:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 200))
             self.main_surf.blit(overlay, (0, 0))
-
             panel = pygame.Rect(CX - 250, CY - 100, 500, 200)
             pygame.draw.rect(self.main_surf, COLOR_HUB,    panel, 0, 15)
             pygame.draw.rect(self.main_surf, (255, 50, 50), panel, 3, 15)
-
             go_surf    = self.large_font.render("GAME OVER",                   True, (255, 80,  80))
             score_surf = self.font.render(f"Final Score: {self.score}",         True, WHITE)
             hint_surf  = self.font.render("Press SPACE to Restart",             True, COLOR_GRID)
-
             self.main_surf.blit(go_surf,    go_surf.get_rect(center=(CX, CY - 40)))
             self.main_surf.blit(score_surf, score_surf.get_rect(center=(CX, CY + 20)))
             self.main_surf.blit(hint_surf,  hint_surf.get_rect(center=(CX, CY + 60)))
 
-        # --- Screen shake ---
         dx, dy = 0, 0
         if self.shake > 0:
-            dx        = random.randint(-self.shake, self.shake)
-            dy        = random.randint(-self.shake, self.shake)
+            dx = random.randint(-self.shake, self.shake)
+            dy = random.randint(-self.shake, self.shake)
             self.shake -= 1
 
         self.screen.blit(self.main_surf, (dx, dy))
         pygame.display.flip()
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
     def run(self) -> None:
         running = True
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if not self.game_over:
+                        if event.button == 3: # Right Click: Rotate
+                            self.current_piece.rotate()
+                            self.audio.play('rotate')
+                        elif event.button in (2, 4, 5): # Middle Click/Scroll: Hold
+                            self.hold_piece()
+                        elif event.button == 1: # Left Click: Hard drop (if center clicked)
+                            mx, my = pygame.mouse.get_pos()
+                            dist = math.sqrt((mx - CX)**2 + (my - CY)**2)
+                            if dist < INNER_RADIUS:
+                                self.current_piece.r = self.target_r
 
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -611,9 +581,5 @@ class Game:
         pygame.quit()
         sys.exit()
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     Game().run()
